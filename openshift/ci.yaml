@@ -1,0 +1,304 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: csdexporter
+  template: csdexporter-jenkins-pipeline
+metadata:
+  annotations:
+    description: Cassandra exporter - Jenkinsfile
+      see https://github.com/Worteks/docker-csdexporter
+    iconClass: icon-openshift
+    openshift.io/display-name: Cassandra Exporter CI
+    openshift.io/provider-display-name: Worteks
+    openshift.io/support-url: https://www.worteks.com
+    tags: csdexporter
+  name: csdexporter-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Tests Cassandra Exporter images
+    name: csdexporter-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def frontName    = 'cicsdx'
+          def gitCommitMsg = ''
+          def templateMark = 'csdx-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 130, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: 'master', description: 'Cassandra Docker Image Tag', name: 'cassandraTag')
+                  string(defaultValue: 'master', description: 'Cassandra Exporter Docker Image - Source Git Branch', name: 'csdexporterBranch')
+                  string(defaultValue: 'master', description: 'Cassandra Exporter Docker Image - Source Git Hash', name: 'csdexporterHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/Worteks/docker-csdexporter.git', description: 'Cassandra Exporter Docker Image - Source Git Repository', name: 'csdexporterRepo')
+                  string(defaultValue: 'master', description: 'Java Docker Image Tag', name: 'javaTag')
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for csdexporter-${frontName}-${params.csdexporterHash}"
+                                      openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.csdexporterHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.csdexporterHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.csdexporterRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-csdexporter-jenkins-pipeline/tmpcsdexporter${params.csdexporterBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmpcsdexporter${params.csdexporterBranch}; mkdir -p tmpcsdexporter${params.csdexporterBranch}"
+                                              dir ("tmpcsdexporter${params.csdexporterBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.csdexporterRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.csdexporterBranch}", url: "https://${GIT_TOKEN}@${params.csdexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.csdexporterRepo}#${params.csdexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.csdexporterRepo} over http"
+                                                          try { git([ branch: "${params.csdexporterBranch}", url: "http://${params.csdexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.csdexporterRepo}#${params.csdexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.csdexporterRepo}#${params.csdexporterBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing CassandraExporter:${params.csdexporterHash}, from ${repoHost}, tagging to ${params.csdexporterBranch}"
+                                              echo "Testing against Cassandra:${params.cassandraTag}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml", '-p', "FRONTNAME=wsweet")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              try {
+                                                  echo " == Creating BuildConfigs =="
+                                                  if (privateRepo) {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "CASSANDRA_EXPORTER_REPOSITORY_REF=${params.csdexporterHash}",
+                                                              '-p', "CASSANDRA_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.csdexporterRepo}", '-p', "FRONTNAME=wsweet", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}")
+                                                      }
+                                                  } else {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml", '-p', "FRONTNAME=wsweet",
+                                                          '-p', "CASSANDRA_EXPORTER_REPOSITORY_REF=${params.csdexporterHash}", '-p', "CASSANDRA_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.csdexporterRepo}")
+                                                  }
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.csdexporterHash}" }
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating BuildConfigs - ${e}" }
+                                              echo " == Creating Demo =="
+                                              objectsFromTemplate = openshift.process("-f", "${templatePath}/run-ephemeral.yaml", '-p', "CASSANDRA_EXPORTER_IMAGE_TAG=${params.csdexporterHash}",
+                                                  '-p', "CASSANDRA_IMAGESTREAM_TAG=cassandra-wsweet:${params.cassandraTag}", '-p', "FRONTNAME=${frontName}-${params.csdexporterHash}")
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.csdexporterHash}" }
+                                              created = openshift.create(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(90) {
+                                              echo "watching csdexporter-wsweet-${params.csdexporterHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "csdexporter-wsweet-${params.csdexporterHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('deploy') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(5) {
+                                              def namespace = "${openshift.project()}"
+                                              try {
+                                                  sh """
+                                                  oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                  oc describe -n ${namespace} imagestreamtag csdexporter-wsweet:${params.csdexporterHash} || exit 1
+                                                  """
+                                              } catch(e) {
+                                                  echo "In catch block while looking for Cassandra Exporter image - ${e}"
+                                                  throw e
+                                              }
+                                              retry(2) {
+                                                  echo "watching cassandra-${frontName}-${params.csdexporterHash} deployment rollout"
+                                                  def dc = openshift.selector("dc", [ name: "cassandra-${frontName}-${params.csdexporterHash}" ]).related('pods')
+                                                  dc.untilEach(1) { return (it.object().status.phase == "Running") }
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while deploying - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('check') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(15) {
+                                              echo "waiting an additional 7 minutes for application to finish starting up"
+                                              sleep 420
+                                              def namespace = "${openshift.project()}"
+                                              retry(3) {
+                                                  try {
+                                                      def response = httpRequest ignoreSslErrors: true, url: "http://csdexporter-${frontName}-${params.csdexporterHash}.${namespace}.svc:9113", timeout: 60, httpMode: 'GET'
+                                                      println("GET prometheus root status: " + response.status)
+                                                      println("GET prometheus root content: " + response.content)
+                                                  } catch(e) { echo "caught ${e}" }
+                                                  response = httpRequest ignoreSslErrors: true, url: "http://csdexporter-${frontName}-${params.csdexporterHash}.${namespace}.svc:9113/metrics", timeout: 60, httpMode: 'GET'
+                                                  println("GET prometheus metric status: " + response.status)
+                                                  println("GET prometheus metric content: " + response.content)
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while checking Cassandra Exporter - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.csdexporterBranch}" == "${params.csdexporterHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc tag -n ${namespace} csdexporter-wsweet:${params.csdexporterHash} csdexporter-wsweet:${params.csdexporterBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging Cassandra Exporter image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.csdexporterRepo} ${params.csdexporterBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for csdexporter-wsweet-${params.csdexporterHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-csdexporter-jenkins-pipeline/tmpcsdexporter${params.csdexporterBranch}"
+                                  openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.csdexporterHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.csdexporterHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "hasUpstream", value: "yes"],
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.csdexporterBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "csdexporter"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.csdexporterHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.csdexporterRepo],
+                                          [$class: 'StringParameterValue', name: "upstreamSourceBranch", value: params.javaTag],
+                                          [$class: 'StringParameterValue', name: "upstreamSourceComponent", value: "java"]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: github.com
